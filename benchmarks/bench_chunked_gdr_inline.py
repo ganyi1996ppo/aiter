@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Self-contained chunked-GDN prefill bench: Triton vs FlyDSL.
+"""Self-contained chunked-GDN prefill bench: vLLM vs aiter-Triton vs FlyDSL.
 
 All 407 unique (T, cu_seqlens) shapes from prefill_gdr.log are embedded
 as a literal at the bottom of this file — no external CSV needed. Just
@@ -9,17 +9,33 @@ run:
 
     HIP_VISIBLE_DEVICES=7 python benchmarks/bench_chunked_gdr_inline.py
 
-Same flags / output as bench_chunked_gdr_from_log.py:
+Three vk-layout backends are compared head-to-head per shape:
 
-    --backends   triton | flydsl | both  (default: both)
-    --warmup N   warmup iters per shape  (default: 25)
-    --iters N    timed iters per shape   (default: 100)
+  * **vllm**   — vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule
+                 (FLA upstream Triton, vk layout, no K-fusion across phases)
+  * **triton** — aiter.ops.triton.gated_delta_net.gated_delta_rule
+                 .chunk_gated_delta_rule_opt_vk
+                 (K1+K2 fused triton, K3+K4 fused triton, K5 opt-vk triton,
+                  K6 chunk_fwd_o_opt_vk triton)
+  * **flydsl** — aiter.ops.flydsl.linear_attention_prefill_kernels
+                 .flydsl_gdr_prefill
+                 (same K1+K2 / K3+K4 / K6 as 'triton', K5 swapped to flydsl)
+
+Same shape, same random inputs (deterministic seed per shape) → the
+deltas are exactly K1+K2 fusion (vllm → triton), K3+K4 fusion (vllm →
+triton), and K5 backend (triton → flydsl).
+
+Flags:
+    --backends   vllm | triton | flydsl | all   (default: all)
+                 also accepts CSV: e.g. --backends vllm,flydsl
+    --warmup N   warmup iters per shape         (default: 25)
+    --iters N    timed iters per shape          (default: 100)
     --limit N    bench only top-N shapes by log_count
     --top K      console top-K summary
     --seed S     deterministic input seed
     --out PATH   write per-shape results CSV (default: stdout-only)
 
-The aggregate block at the end reports:
+The aggregate block at the end reports, for every benched-backend pair:
     * Overall speedup (log-weighted by call frequency in the source workload)
     * Geometric mean of per-shape speedups (right average for ratios)
     * Arithmetic mean
@@ -58,8 +74,33 @@ QWEN3_NEXT_V = 128
 # ---------------------------------------------------------------------------
 
 
+def _load_vllm_backend() -> Callable:
+    """FLA upstream vk pipeline as shipped in vLLM (chunk.py — no K-fusion
+    across phases, each of K1/K2/K3/K4/K5/K6 launches separately)."""
+    from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule
+    return chunk_gated_delta_rule
+
+
+def _load_atom_backend() -> Callable:
+    """ATOM's vendored vk port of the vLLM FLA pipeline
+    (atom.model_ops.fla_ops.chunk_vk.chunk_gated_delta_rule_vk).
+
+    Should be ~bit-equal to the 'vllm' backend in steady state (verified
+    by tests/test_chunk_gated_delta_rule_vk.py). Existing as a separate
+    backend lets us catch any latent perf gap from ATOM's local edits
+    (the o= inplace plumbing, the optional flydsl dispatch, etc.).
+
+    Run with the flydsl dispatch OFF so we're comparing the ATOM Triton
+    pipeline (= vendored vLLM kernels + ATOM's o= wiring) against the
+    vLLM Triton pipeline — i.e. isolating only the ATOM-side wiring."""
+    import os
+    os.environ["ATOM_USE_FLYDSL_GDR_PREFILL"] = "0"
+    from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
+    return chunk_gated_delta_rule_vk
+
+
 def _load_triton_backend() -> Callable:
-    """Triton-only K1-K6 end-to-end vk pipeline."""
+    """aiter Triton K1+K2/K3+K4 fused end-to-end vk pipeline."""
     from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
         chunk_gated_delta_rule_opt_vk,
     )
@@ -67,11 +108,24 @@ def _load_triton_backend() -> Callable:
 
 
 def _load_flydsl_backend() -> Callable:
-    """FlyDSL-K5 end-to-end vk pipeline."""
+    """aiter FlyDSL-K5 end-to-end vk pipeline (same K1+K2/K3+K4/K6 as the
+    'triton' backend, only K5 differs)."""
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         flydsl_gdr_prefill,
     )
     return flydsl_gdr_prefill
+
+
+# Single registry so the rest of the bench loop can iterate uniformly.
+# Order matters: it determines the column order in the per-shape log line,
+# the per-shape CSV, and the canonical baseline (first entry) used for
+# the relative-speedup display.
+_BACKEND_REGISTRY: dict[str, Callable[[], Callable]] = {
+    "vllm": _load_vllm_backend,
+    "atom": _load_atom_backend,
+    "triton": _load_triton_backend,
+    "flydsl": _load_flydsl_backend,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +236,63 @@ def _bench_one(
 # ---------------------------------------------------------------------------
 
 
+def _parse_backends_arg(arg: str) -> list[str]:
+    """Accept either the shorthand 'all' or a comma-separated list of
+    registry keys. Preserves the registry's canonical order so output is
+    deterministic regardless of CLI input ordering."""
+    if arg == "all":
+        return list(_BACKEND_REGISTRY.keys())
+    requested = [x.strip() for x in arg.split(",") if x.strip()]
+    unknown = [x for x in requested if x not in _BACKEND_REGISTRY]
+    if unknown:
+        sys.exit(
+            f"unknown backend(s): {unknown}. "
+            f"Valid: {list(_BACKEND_REGISTRY)} or 'all'."
+        )
+    # canonical order
+    return [k for k in _BACKEND_REGISTRY if k in requested]
+
+
+def _summarize_speedups(label: str, speedups: list[float], *,
+                        a_total: float, b_total: float, a_name: str, b_name: str,
+                        n_shapes_total: int):
+    """Pretty-print the per-pair aggregate (geomean, arith, median, etc.)."""
+    if not speedups or a_total == 0 or b_total == 0:
+        print(f"  {label}: no comparable shapes")
+        return
+    geo_mean = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
+    arith_mean = sum(speedups) / len(speedups)
+    sorted_s = sorted(speedups)
+    median = sorted_s[len(sorted_s) // 2]
+    wins = sum(1 for s in speedups if s > 1.0)
+    losses = sum(1 for s in speedups if s < 1.0)
+    ties = len(speedups) - wins - losses
+    p_min, p_max = sorted_s[0], sorted_s[-1]
+    overall = a_total / b_total
+    faster = b_name if overall > 1.0 else a_name
+    print(f"  {label}  ({a_name} / {b_name}):")
+    print(f"    {a_name} total wall time: {a_total/1e6:>10.3f} s")
+    print(f"    {b_name} total wall time: {b_total/1e6:>10.3f} s")
+    print(f"    Overall speedup (log-weighted): {overall:>7.3f}x   "
+          f"(faster overall: {faster})")
+    print(f"    Geometric mean:                 {geo_mean:>7.3f}x   "
+          f"(right average for ratios)")
+    print(f"    Arithmetic mean:                {arith_mean:>7.3f}x")
+    print(f"    Median:                         {median:>7.3f}x")
+    print(f"    Min / Max:                      {p_min:>7.3f}x  /  {p_max:.3f}x")
+    print(f"    Per-shape outcome: {b_name} wins {wins} | loses {losses}"
+          f"{f' | ties {ties}' if ties else ''}  "
+          f"(out of {len(speedups)} comparable shapes, "
+          f"{n_shapes_total} benched total)")
+
+
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=None,
                     help="optional output CSV (default: don't write)")
-    ap.add_argument("--backends", choices=("triton", "flydsl", "both"), default="both")
+    ap.add_argument("--backends", default="all",
+                    help="comma-separated subset of "
+                         f"{list(_BACKEND_REGISTRY)}, or 'all' (default).")
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--limit", type=int, default=None,
@@ -205,27 +311,23 @@ def main():
         shapes = shapes[: args.limit]
     total_log_calls = sum(s["log_count"] for s in shapes)
 
-    triton_fn = None
-    flydsl_fn = None
-    if args.backends in ("triton", "both"):
+    backend_names = _parse_backends_arg(args.backends)
+    backend_fns: dict[str, Callable] = {}
+    for name in backend_names:
         try:
-            triton_fn = _load_triton_backend()
+            backend_fns[name] = _BACKEND_REGISTRY[name]()
         except ImportError as e:
-            sys.exit(f"Triton backend import failed: {e}")
-    if args.backends in ("flydsl", "both"):
-        try:
-            flydsl_fn = _load_flydsl_backend()
-        except ImportError as e:
-            sys.exit(f"FlyDSL backend import failed: {e}")
+            sys.exit(f"{name} backend import failed: {e}")
 
     print(f"Device:   {torch.cuda.get_device_name(0)}", flush=True)
     print(f"Shapes:   {len(shapes)} unique (covering {total_log_calls:,} log calls)",
           flush=True)
-    print(f"Backends: {args.backends}    warmup={args.warmup}  iters={args.iters}",
+    print(f"Backends: {backend_names}    warmup={args.warmup}  iters={args.iters}",
           flush=True)
     print("", flush=True)
 
-    results = []
+    # Per-shape results: each row stores us[name] for every benched backend.
+    results: list[dict] = []
     t_start = time.time()
     try:
         for i, shape in enumerate(shapes):
@@ -233,30 +335,17 @@ def main():
             n_seqs = shape["num_seqs"]
             log_n = shape["log_count"]
 
-            triton_us = None
-            flydsl_us = None
-            if triton_fn is not None:
-                triton_us = _bench_one(
-                    triton_fn, shape,
-                    warmup=args.warmup, iters=args.iters, seed=args.seed,
-                )
-            if flydsl_fn is not None:
-                flydsl_us = _bench_one(
-                    flydsl_fn, shape,
-                    warmup=args.warmup, iters=args.iters, seed=args.seed,
-                )
-
-            speedup = (
-                triton_us / flydsl_us if (triton_us and flydsl_us) else None
-            )
-            results.append({
+            row = {
                 "T": T, "num_seqs": n_seqs,
-                "cu_seqlens": shape["cu_seqlens"],
-                "log_count": log_n,
-                "triton_us": triton_us,
-                "flydsl_us": flydsl_us,
-                "speedup": speedup,
-            })
+                "cu_seqlens": shape["cu_seqlens"], "log_count": log_n,
+                "us": {},
+            }
+            for name in backend_names:
+                row["us"][name] = _bench_one(
+                    backend_fns[name], shape,
+                    warmup=args.warmup, iters=args.iters, seed=args.seed,
+                )
+            results.append(row)
 
             cu_preview = shape["cu_seqlens"]
             cu_str = (
@@ -267,116 +356,120 @@ def main():
                      f"T={T:>6}", f"n={n_seqs:>3}",
                      f"cnt={log_n:>5}",
                      f"cu={cu_str}"]
-            if triton_us is not None:
-                cells.append(f"triton={triton_us:>9.2f}us")
-            if flydsl_us is not None:
-                cells.append(f"flydsl={flydsl_us:>9.2f}us")
-            if speedup is not None:
-                cells.append(f"flydsl/triton speedup={speedup:>5.2f}x")
+            for name in backend_names:
+                cells.append(f"{name}={row['us'][name]:>9.2f}us")
+            # If at least two backends ran, show speedups relative to the
+            # FIRST benched backend (the canonical-order baseline).
+            if len(backend_names) >= 2:
+                base = backend_names[0]
+                for name in backend_names[1:]:
+                    su = row["us"][base] / row["us"][name]
+                    cells.append(f"{name}/{base}={su:>5.2f}x")
             print("  ".join(cells), flush=True)
     except KeyboardInterrupt:
         print("\n[interrupted, writing partial results if --out is set]", flush=True)
 
     elapsed = time.time() - t_start
 
-    # Optional CSV output.
+    # Optional CSV output. Columns: T, num_seqs, cu_seqlens, log_count,
+    # <name>_us for each backend, <a>_to_<b>_speedup for each pair,
+    # <name>_impact_us for each backend.
     if args.out is not None:
         with args.out.open("w", newline="") as f:
             w = csv.writer(f)
-            w.writerow([
-                "T", "num_seqs", "cu_seqlens", "log_count",
-                "triton_us", "flydsl_us", "speedup_flydsl_over_triton",
-                "triton_total_impact_us", "flydsl_total_impact_us",
-            ])
+            header = ["T", "num_seqs", "cu_seqlens", "log_count"]
+            header += [f"{n}_us" for n in backend_names]
+            # Pairs: a/b speedup = us[a] / us[b]. Numerator is the
+            # canonical-order earlier backend; positive >1 means the
+            # later backend is faster.
+            pairs: list[tuple[str, str]] = []
+            for i, a in enumerate(backend_names):
+                for b in backend_names[i+1:]:
+                    pairs.append((a, b))
+                    header.append(f"speedup_{b}_over_{a}")
+            header += [f"{n}_impact_us" for n in backend_names]
+            w.writerow(header)
             for r in results:
-                tr_imp = (r["triton_us"] * r["log_count"]) if r["triton_us"] else ""
-                fl_imp = (r["flydsl_us"] * r["log_count"]) if r["flydsl_us"] else ""
-                w.writerow([
+                cells = [
                     r["T"], r["num_seqs"],
                     " ".join(str(x) for x in r["cu_seqlens"]),
                     r["log_count"],
-                    f"{r['triton_us']:.2f}" if r["triton_us"] else "",
-                    f"{r['flydsl_us']:.2f}" if r["flydsl_us"] else "",
-                    f"{r['speedup']:.3f}" if r["speedup"] else "",
-                    f"{tr_imp:.0f}" if isinstance(tr_imp, float) else "",
-                    f"{fl_imp:.0f}" if isinstance(fl_imp, float) else "",
-                ])
+                ]
+                for n in backend_names:
+                    cells.append(f"{r['us'][n]:.2f}" if r["us"].get(n) else "")
+                for a, b in pairs:
+                    if r["us"].get(a) and r["us"].get(b):
+                        cells.append(f"{r['us'][a] / r['us'][b]:.3f}")
+                    else:
+                        cells.append("")
+                for n in backend_names:
+                    imp = (r["us"].get(n) or 0) * r["log_count"]
+                    cells.append(f"{imp:.0f}" if r["us"].get(n) else "")
+                w.writerow(cells)
         print(f"\nWrote: {args.out}  ({len(results)} rows, {elapsed:.1f}s)",
               flush=True)
     else:
         print(f"\nBench done in {elapsed:.1f}s. "
               f"Pass --out PATH to write per-shape results to CSV.", flush=True)
 
-    # Top-K and aggregate summary.
-    if triton_fn is not None:
-        top = sorted(
-            (r for r in results if r["triton_us"]),
-            key=lambda r: -(r["triton_us"] * r["log_count"]),
-        )[: args.top]
-        print(f"\nTop {min(args.top, len(top))} shapes by Triton total impact "
-              f"(log_count × triton_us):")
-        header = f"{'T':>6} {'n':>3} {'cnt':>5} {'triton_us':>11} "
-        if flydsl_fn is not None:
-            header += f"{'flydsl_us':>11} {'speedup':>8} "
-        header += f"{'tr_impact_ms':>14}"
-        if flydsl_fn is not None:
-            header += f" {'fl_impact_ms':>14}"
-        print(header)
-        print("-" * len(header))
-        for r in top:
-            line = (
-                f"{r['T']:>6} {r['num_seqs']:>3} {r['log_count']:>5} "
-                f"{r['triton_us']:>11.2f} "
-            )
-            if flydsl_fn is not None and r["flydsl_us"]:
-                line += f"{r['flydsl_us']:>11.2f} {r['speedup']:>7.2f}x "
-            elif flydsl_fn is not None:
-                line += f"{'-':>11} {'-':>8} "
-            tr_imp_ms = r["triton_us"] * r["log_count"] / 1000.0
-            line += f"{tr_imp_ms:>14,.1f}"
-            if flydsl_fn is not None and r["flydsl_us"]:
-                fl_imp_ms = r["flydsl_us"] * r["log_count"] / 1000.0
-                line += f" {fl_imp_ms:>14,.1f}"
-            print(line)
+    # Top-K shapes by total impact, using the FIRST benched backend as the
+    # canonical impact metric (it's the baseline against which speedups
+    # are reported).
+    if not results:
+        return
+    impact_name = backend_names[0]
+    top = sorted(
+        (r for r in results if r["us"].get(impact_name)),
+        key=lambda r: -(r["us"][impact_name] * r["log_count"]),
+    )[: args.top]
+    print(f"\nTop {min(args.top, len(top))} shapes by {impact_name} total "
+          f"impact (log_count × {impact_name}_us):")
+    header_cols = [f"{'T':>6}", f"{'n':>3}", f"{'cnt':>5}"]
+    for n in backend_names:
+        header_cols.append(f"{n+'_us':>12}")
+    header_cols.append(f"{impact_name+'_impact_ms':>16}")
+    header = "  ".join(header_cols)
+    print(header)
+    print("-" * len(header))
+    for r in top:
+        cells = [f"{r['T']:>6}", f"{r['num_seqs']:>3}", f"{r['log_count']:>5}"]
+        for n in backend_names:
+            u = r["us"].get(n)
+            cells.append(f"{u:>12.2f}" if u else f"{'-':>12}")
+        imp_ms = r["us"][impact_name] * r["log_count"] / 1000.0
+        cells.append(f"{imp_ms:>16,.1f}")
+        print("  ".join(cells))
 
-        if flydsl_fn is not None:
-            tr_total = sum(
-                r["triton_us"] * r["log_count"] for r in results if r["triton_us"]
+    # Aggregate per-pair summary.
+    if len(backend_names) >= 2:
+        print(f"\nAggregate over {len(results)} benched shapes "
+              f"({total_log_calls:,} log calls):")
+        # For each ordered (a, b) pair, report `a / b` so values > 1 mean
+        # b is faster (because a took more time per call than b).
+        pairs = []
+        for i, a in enumerate(backend_names):
+            for b in backend_names[i+1:]:
+                pairs.append((a, b))
+        for a, b in pairs:
+            a_total = sum(
+                (r["us"].get(a) or 0) * r["log_count"] for r in results
+                if r["us"].get(a) and r["us"].get(b)
             )
-            fl_total = sum(
-                r["flydsl_us"] * r["log_count"] for r in results
-                if r["flydsl_us"] and r["triton_us"]
+            b_total = sum(
+                (r["us"].get(b) or 0) * r["log_count"] for r in results
+                if r["us"].get(a) and r["us"].get(b)
             )
-            speedups = [r["speedup"] for r in results if r["speedup"]]
-            if tr_total > 0 and speedups:
-                geo_mean = math.exp(
-                    sum(math.log(s) for s in speedups) / len(speedups)
-                )
-                arith_mean = sum(speedups) / len(speedups)
-                sorted_s = sorted(speedups)
-                median = sorted_s[len(sorted_s) // 2]
-                wins = sum(1 for s in speedups if s > 1.0)
-                losses = sum(1 for s in speedups if s < 1.0)
-                ties = len(speedups) - wins - losses
-                p_min = sorted_s[0]
-                p_max = sorted_s[-1]
-
-                print(f"\nAggregate over {len(results)} benched shapes "
-                      f"({total_log_calls:,} log calls):")
-                print(f"  Triton total wall time:        {tr_total/1e6:>10.3f} s")
-                print(f"  FlyDSL total wall time:        {fl_total/1e6:>10.3f} s")
-                print(f"  Overall speedup (log-weighted):{tr_total/fl_total:>10.3f}x"
-                      f"   (FlyDSL faster overall: {tr_total > fl_total})")
-                print(f"  Avg speedup (geometric mean):  {geo_mean:>10.3f}x"
-                      f"   (right average for ratios)")
-                print(f"  Avg speedup (arithmetic mean): {arith_mean:>10.3f}x")
-                print(f"  Median speedup:                {median:>10.3f}x")
-                print(f"  Min / Max speedup:             "
-                      f"{p_min:>10.3f}x  /  {p_max:>.3f}x")
-                print(f"  Per-shape outcome:    "
-                      f"FlyDSL wins {wins} | loses {losses}"
-                      f"{f' | ties {ties}' if ties else ''}  "
-                      f"(out of {len(speedups)} shapes)")
+            speedups = [
+                r["us"][a] / r["us"][b] for r in results
+                if r["us"].get(a) and r["us"].get(b)
+            ]
+            _summarize_speedups(
+                label=f"{a:>6} vs {b:>6}",
+                speedups=speedups,
+                a_total=a_total, b_total=b_total,
+                a_name=a, b_name=b,
+                n_shapes_total=len(results),
+            )
 
 
 # ---------------------------------------------------------------------------
