@@ -204,13 +204,27 @@ def make(n, kind, seed, misaligned_w=False):
     }
 
 
-def run(c, n, marshalled=False):
-    """marshalled=True calls the generic aiter_tensor_t entry directly, bypassing the raw-pointer front."""
+def run(c, n, marshalled=False, misaligned_out=False):
+    """marshalled=True calls the generic aiter_tensor_t entry directly, bypassing the raw-pointer front.
+    misaligned_out=True slices q_out / index_q_fp8_out at an odd storage offset (see make()'s
+    misaligned_w note, applied to the outputs): q is no longer 8 B aligned and iq no longer 4 B
+    aligned, so the prefill wave's uint2 (q_out) / int (index_q_fp8_out) stores must decline to the
+    generic kernel instead of storing misaligned.
+    """
     from aiter.ops import fused_qknorm_idxrqknorm as op
 
     kv, idx = c["kv"].clone(), c["idx"].clone()
-    q = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
-    iq = torch.zeros(n, NIQ * D, dtype=torch.float8_e4m3fn, device=dev)
+    if misaligned_out:
+        qpad = torch.zeros(n * NQ * D + 4, dtype=torch.bfloat16, device=dev)
+        q = qpad[1 : 1 + n * NQ * D].view(n, NQ * D)
+        iqpad = torch.zeros(n * NIQ * D + 4, dtype=torch.float8_e4m3fn, device=dev)
+        iq = iqpad[1 : 1 + n * NIQ * D].view(n, NIQ * D)
+        assert (
+            q.data_ptr() % 8 != 0 and iq.data_ptr() % 4 != 0
+        ), "test setup: output views are unexpectedly aligned"
+    else:
+        q = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
+        iq = torch.zeros(n, NIQ * D, dtype=torch.float8_e4m3fn, device=dev)
     fn = op._fused_qknorm_idxrqknorm_hip if marshalled else op.fused_qknorm_idxrqknorm
     fn(
         c["qkv"], c["w"][0], c["w"][1], c["cs"], c["pos"], NQ, NKV, ROT, EPS, c["w"][2], c["w"][3], NIQ,
@@ -372,6 +386,23 @@ def child(args):
         res[f"{n}/misaligned_w"] = {k: dig(v) for k, v in run(c, n).items()}
         res[f"{n}/misaligned_w/marshalled"] = {
             k: dig(v) for k, v in run(c, n, marshalled=True).items()
+        }
+        del c
+    # q_out (bf16, uint2 8 B stores) / index_q_fp8_out (e4m3, int 4 B stores) sliced at an odd
+    # storage offset: must give the generic kernel's bytes under both floors, proving the prefill
+    # wave declines (launchNvfp4Prefill's pfPtrAligned8(q_out) / pfPtrAligned4(index_q_fp8_out))
+    # instead of reaching its vectorized stores misaligned.
+    for n in (DISPATCH_PROBE_N, 511, 512, 2048):
+        try:
+            c = make(n, "aligned", 0)
+        except NoSlots:
+            continue
+        res[f"{n}/misaligned_out"] = {
+            k: dig(v) for k, v in run(c, n, misaligned_out=True).items()
+        }
+        res[f"{n}/misaligned_out/marshalled"] = {
+            k: dig(v)
+            for k, v in run(c, n, marshalled=True, misaligned_out=True).items()
         }
         del c
     res["_prefill_launched"] = prefill_launched(DISPATCH_PROBE_N)

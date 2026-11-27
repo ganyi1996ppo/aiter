@@ -1698,10 +1698,19 @@ static int pfMinTokens()
 // The prefill variant's wave loads/stores of the norm weights and cos/sin cache use uint2 (8 B)
 // accesses whose base must itself be 8 B aligned (the per-lane offset `dim0` is always a multiple
 // of kElemsPerLane * sizeof(scalar_t), i.e. 8 B, so only the tensor's own storage_offset can break
-// alignment, e.g. a bf16 view sliced at an odd element offset).
+// alignment, e.g. a bf16 view sliced at an odd element offset). The bf16 q_out store is uint2 too,
+// so it shares this check; the e4m3 index_q_fp8_out store is one dword (4 B) and uses pfPtrAligned4.
 static bool pfPtrAligned8(const void* p)
 {
     return (reinterpret_cast<uintptr_t>(p) % 8) == 0;
+}
+
+// index_q_fp8_out is written one dword at a time (__builtin_amdgcn_cvt_pk_fp8_f32 packs four e4m3
+// elements into an int store); the per-lane offset is a multiple of kElemsPerLane (4 B), so only
+// the tensor's own storage_offset can drop the base below 4 B alignment.
+static bool pfPtrAligned4(const void* p)
+{
+    return (reinterpret_cast<uintptr_t>(p) % 4) == 0;
 }
 
 static bool pfDeviceIsGfx950()
@@ -1833,10 +1842,13 @@ static bool launchNvfp4Prefill(const scalar_t* qkv,
         }
         // A norm weight or the cos/sin cache can be a contiguous view with an odd storage_offset
         // (e.g. sliced at element 1): shape/dtype/contiguity checks upstream do not catch that, but
-        // it breaks the uint2 loads below. Decline to the generic kernel instead of risking a
-        // misaligned load.
+        // it breaks the uint2 loads below. The two outputs the kernel stores to have the same
+        // requirement: q_out is written with uint2 (8 B) non-temporal stores and index_q_fp8_out
+        // with int (4 B) stores, so a sliced output view with an odd storage_offset breaks those
+        // too. Decline to the generic kernel instead of risking a misaligned load or store.
         if(!pfPtrAligned8(q_norm_w) || !pfPtrAligned8(k_norm_w) || !pfPtrAligned8(iq_norm_w) ||
-           !pfPtrAligned8(ik_norm_w) || !pfPtrAligned8(cos_sin_cache))
+           !pfPtrAligned8(ik_norm_w) || !pfPtrAligned8(cos_sin_cache) || !pfPtrAligned8(q_out) ||
+           !pfPtrAligned4(index_q_fp8_out))
         {
             return false;
         }
